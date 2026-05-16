@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use axum::http::HeaderMap;
 use std::{
     collections::HashMap,
@@ -12,17 +13,32 @@ pub struct AuthContext {
     pub api_key_prefix: String,
     pub tenant_id: String,
     pub project_id: String,
+    pub api_key_urn: Option<String>,
+    pub tenant_urn: Option<String>,
+    pub scopes: Vec<String>,
+    pub role: Option<String>,
+    pub environment: Option<String>,
 }
 
+#[async_trait]
 pub trait Authenticator: Send + Sync {
-    fn authenticate(&self, headers: &HeaderMap) -> Result<AuthContext, GatewayError>;
+    async fn authenticate(
+        &self,
+        headers: &HeaderMap,
+        required_scope: &'static str,
+    ) -> Result<AuthContext, GatewayError>;
 }
 
 #[derive(Debug, Default)]
 pub struct LocalAuthenticator;
 
+#[async_trait]
 impl Authenticator for LocalAuthenticator {
-    fn authenticate(&self, headers: &HeaderMap) -> Result<AuthContext, GatewayError> {
+    async fn authenticate(
+        &self,
+        headers: &HeaderMap,
+        _required_scope: &'static str,
+    ) -> Result<AuthContext, GatewayError> {
         let Some(value) = headers.get(axum::http::header::AUTHORIZATION) else {
             return Err(GatewayError::Unauthorized(
                 "missing bearer token".to_string(),
@@ -48,8 +64,43 @@ impl Authenticator for LocalAuthenticator {
             api_key_prefix: prefix,
             tenant_id: header_or_default(headers, "x-relayx-tenant", "tenant_local"),
             project_id: header_or_default(headers, "x-relayx-project", "project_default"),
+            api_key_urn: None,
+            tenant_urn: None,
+            scopes: vec!["relayx:dev".to_string()],
+            role: Some("local".to_string()),
+            environment: Some("local".to_string()),
         })
     }
+}
+
+pub fn internal_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
+    client_ip(headers)
+}
+
+pub fn bearer_token(headers: &HeaderMap) -> Result<&str, GatewayError> {
+    let Some(value) = headers.get(axum::http::header::AUTHORIZATION) else {
+        return Err(GatewayError::Unauthorized(
+            "missing bearer token".to_string(),
+        ));
+    };
+
+    let raw = value
+        .to_str()
+        .map_err(|_| GatewayError::Unauthorized("invalid authorization header".to_string()))?;
+
+    let token = raw.strip_prefix("Bearer ").ok_or_else(|| {
+        GatewayError::Unauthorized("authorization must use bearer scheme".to_string())
+    })?;
+
+    if token.trim().is_empty() {
+        return Err(GatewayError::Unauthorized("empty bearer token".to_string()));
+    }
+
+    Ok(token)
+}
+
+pub fn key_prefix(token: &str) -> String {
+    token.chars().take(12).collect()
 }
 
 fn enforce_ip_allowlist(api_key_prefix: &str, headers: &HeaderMap) -> Result<(), GatewayError> {
@@ -217,5 +268,10 @@ mod tests {
             HeaderValue::from_static("203.0.113.13, 10.0.0.2"),
         );
         assert_eq!(client_ip(&headers), None);
+    }
+
+    #[test]
+    fn key_prefix_uses_first_twelve_chars() {
+        assert_eq!(key_prefix("rx_live_abcdef"), "rx_live_abcd");
     }
 }

@@ -57,12 +57,17 @@ pub async fn execute_chat(
                 let usage_event =
                     usage::build_usage_event(&request, response.usage.completion_tokens);
 
-                state.logs.push(RequestLog {
+                let log = RequestLog {
                     request_id: context.request_id.clone(),
                     timestamp: logs::unix_timestamp(),
                     tenant_id: context.auth.tenant_id.clone(),
+                    tenant_urn: context.auth.tenant_urn.clone(),
                     project_id: context.auth.project_id.clone(),
                     api_key_prefix: context.auth.api_key_prefix.clone(),
+                    api_key_urn: context.auth.api_key_urn.clone(),
+                    key_role: context.auth.role.clone(),
+                    key_environment: context.auth.environment.clone(),
+                    key_scopes: context.auth.scopes.clone(),
                     model: request.model.clone(),
                     provider: provider_request.provider.clone(),
                     provider_model: provider_request.provider_model.clone(),
@@ -74,7 +79,9 @@ pub async fn execute_chat(
                     estimated_cost_usd: usage_event.estimated_cost_usd,
                     cache_status: "miss".to_string(),
                     error: None,
-                });
+                };
+                state.logs.push(log.clone());
+                emit_platform_events(state, "relayx.request.completed", log);
 
                 if cache::is_cacheable(&request) {
                     let key = cache::cache_key(
@@ -106,12 +113,17 @@ pub async fn execute_chat(
     }
 
     let error = last_error.unwrap_or_else(|| "all route candidates failed".to_string());
-    state.logs.push(RequestLog {
+    let log = RequestLog {
         request_id: context.request_id.clone(),
         timestamp: logs::unix_timestamp(),
         tenant_id: context.auth.tenant_id.clone(),
+        tenant_urn: context.auth.tenant_urn.clone(),
         project_id: context.auth.project_id.clone(),
         api_key_prefix: context.auth.api_key_prefix.clone(),
+        api_key_urn: context.auth.api_key_urn.clone(),
+        key_role: context.auth.role.clone(),
+        key_environment: context.auth.environment.clone(),
+        key_scopes: context.auth.scopes.clone(),
         model: request.model,
         provider: "routing".to_string(),
         provider_model: "unknown".to_string(),
@@ -123,13 +135,24 @@ pub async fn execute_chat(
         estimated_cost_usd: 0.0,
         cache_status: "miss".to_string(),
         error: Some(error.clone()),
-    });
+    };
+    state.logs.push(log.clone());
+    emit_platform_events(state, "relayx.request.failed", log);
 
     Err(GatewayError::Provider {
         provider: "routing".to_string(),
         message: error,
         kind: ProviderErrorKind::Unavailable,
     })
+}
+
+fn emit_platform_events(state: &AppState, event_type: &'static str, log: RequestLog) {
+    let publisher = state.event_publisher.clone();
+    let meter = state.usage_meter.clone();
+    tokio::spawn(async move {
+        publisher.publish_request_log(event_type, &log).await;
+        meter.record_request_usage(&log).await;
+    });
 }
 
 pub async fn execute_stream(

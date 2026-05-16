@@ -234,6 +234,11 @@ mod tests {
             api_key_prefix: prefix.to_string(),
             tenant_id: "tenant".to_string(),
             project_id: project.to_string(),
+            api_key_urn: None,
+            tenant_urn: None,
+            scopes: vec![],
+            role: None,
+            environment: None,
         }
     }
 

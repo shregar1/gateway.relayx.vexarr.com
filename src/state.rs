@@ -1,6 +1,8 @@
 use crate::auth::{Authenticator, LocalAuthenticator};
 use crate::cache::{ExactCache, LocalExactCache, RedisExactCache};
 use crate::health::ProviderHealthRegistry;
+use crate::integrations::{ComplianceAuditSink, EventPublisher, SchedulerIntegration, UsageMeter};
+use crate::keyx::{KeyxAuthenticator, KeyxConfig};
 use crate::logs::RequestLogStore;
 use crate::native_providers::{
     AnthropicProvider, AzureOpenAIProvider, BedrockProvider, GeminiProvider,
@@ -13,20 +15,24 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct AppState {
     pub auth: Arc<dyn Authenticator>,
+    pub audit_sink: Arc<dyn ComplianceAuditSink>,
     pub cache: Arc<dyn ExactCache>,
     pub health: ProviderHealthRegistry,
     pub logs: RequestLogStore,
+    pub event_publisher: Arc<dyn EventPublisher>,
     pub providers: Arc<ProviderRegistry>,
     pub rate_limiter: Arc<dyn RateLimiter>,
     pub routing: Arc<RoutingEngine>,
+    pub scheduler: Arc<dyn SchedulerIntegration>,
+    pub usage_meter: Arc<dyn UsageMeter>,
 }
 
 impl AppState {
     pub async fn new() -> Self {
         let mut providers = ProviderRegistry::default();
         providers.register("mock", Arc::new(MockProvider));
-        register_native_providers(&mut providers);
-        register_openai_compatible_providers(&mut providers);
+        register_native_providers(&mut providers).await;
+        register_openai_compatible_providers(&mut providers).await;
 
         let redis_url = redis_url();
         let cache: Arc<dyn ExactCache> = match &redis_url {
@@ -52,15 +58,40 @@ impl AppState {
             None => Arc::new(LocalRateLimiter::new(rate_config)),
         };
 
-        Self {
-            auth: Arc::new(LocalAuthenticator),
+        let auth: Arc<dyn Authenticator> = match std::env::var("RELAYX_AUTH_MODE")
+            .unwrap_or_else(|_| "local".to_string())
+            .as_str()
+        {
+            "keyx" => match KeyxConfig::from_env() {
+                Ok(config) => Arc::new(KeyxAuthenticator::new(config)),
+                Err(error) => {
+                    tracing::warn!(error = %error, "falling back to local auth");
+                    Arc::new(LocalAuthenticator)
+                }
+            },
+            _ => Arc::new(LocalAuthenticator),
+        };
+
+        let state = Self {
+            auth,
+            audit_sink: crate::integrations::audit_sink_from_env(),
             cache,
             health: ProviderHealthRegistry::default(),
             logs: RequestLogStore::new(1_000),
+            event_publisher: crate::integrations::event_publisher_from_env(),
             providers: Arc::new(providers),
             rate_limiter,
             routing: Arc::new(RoutingEngine::with_defaults()),
-        }
+            scheduler: crate::integrations::scheduler_from_env(),
+            usage_meter: crate::integrations::usage_meter_from_env(),
+        };
+
+        let scheduler = state.scheduler.clone();
+        tokio::spawn(async move {
+            scheduler.ensure_relayx_jobs().await;
+        });
+
+        state
     }
 }
 
@@ -70,8 +101,8 @@ fn redis_url() -> Option<String> {
         .or_else(|| std::env::var("REDIS_URL").ok())
 }
 
-fn register_native_providers(providers: &mut ProviderRegistry) {
-    if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
+async fn register_native_providers(providers: &mut ProviderRegistry) {
+    if let Some(api_key) = secret("ANTHROPIC_API_KEY").await {
         providers.register(
             "anthropic",
             Arc::new(AnthropicProvider::new(
@@ -82,9 +113,7 @@ fn register_native_providers(providers: &mut ProviderRegistry) {
         );
     }
 
-    if let Ok(api_key) =
-        std::env::var("GEMINI_API_KEY").or_else(|_| std::env::var("GOOGLE_API_KEY"))
-    {
+    if let Some(api_key) = secret_any(&["GEMINI_API_KEY", "GOOGLE_API_KEY"]).await {
         providers.register(
             "gemini",
             Arc::new(GeminiProvider::new(
@@ -97,10 +126,10 @@ fn register_native_providers(providers: &mut ProviderRegistry) {
         );
     }
 
-    if let (Ok(endpoint), Ok(deployment), Ok(api_key)) = (
+    if let (Ok(endpoint), Ok(deployment), Some(api_key)) = (
         std::env::var("AZURE_OPENAI_ENDPOINT"),
         std::env::var("AZURE_OPENAI_DEPLOYMENT"),
-        std::env::var("AZURE_OPENAI_API_KEY"),
+        secret("AZURE_OPENAI_API_KEY").await,
     ) {
         providers.register(
             "azure_openai",
@@ -113,10 +142,10 @@ fn register_native_providers(providers: &mut ProviderRegistry) {
         );
     }
 
-    if let (Ok(region), Ok(access_key_id), Ok(secret_access_key)) = (
+    if let (Ok(region), Some(access_key_id), Some(secret_access_key)) = (
         std::env::var("AWS_BEDROCK_REGION").or_else(|_| std::env::var("AWS_REGION")),
-        std::env::var("AWS_ACCESS_KEY_ID"),
-        std::env::var("AWS_SECRET_ACCESS_KEY"),
+        secret("AWS_ACCESS_KEY_ID").await,
+        secret("AWS_SECRET_ACCESS_KEY").await,
     ) {
         providers.register(
             "bedrock",
@@ -125,15 +154,15 @@ fn register_native_providers(providers: &mut ProviderRegistry) {
                 crate::aws_sigv4::AwsCredentials {
                     access_key_id,
                     secret_access_key,
-                    session_token: std::env::var("AWS_SESSION_TOKEN").ok(),
+                    session_token: secret("AWS_SESSION_TOKEN").await,
                 },
             )),
         );
     }
 }
 
-fn register_openai_compatible_providers(providers: &mut ProviderRegistry) {
-    if let Ok(api_key) = std::env::var("OPENAI_API_KEY") {
+async fn register_openai_compatible_providers(providers: &mut ProviderRegistry) {
+    if let Some(api_key) = secret("OPENAI_API_KEY").await {
         providers.register(
             "openai",
             Arc::new(OpenAICompatibleProvider::new(
@@ -144,7 +173,7 @@ fn register_openai_compatible_providers(providers: &mut ProviderRegistry) {
         );
     }
 
-    if let Ok(api_key) = std::env::var("GROQ_API_KEY") {
+    if let Some(api_key) = secret("GROQ_API_KEY").await {
         providers.register(
             "groq",
             Arc::new(OpenAICompatibleProvider::new(
@@ -155,7 +184,7 @@ fn register_openai_compatible_providers(providers: &mut ProviderRegistry) {
         );
     }
 
-    if let Ok(api_key) = std::env::var("TOGETHER_API_KEY") {
+    if let Some(api_key) = secret("TOGETHER_API_KEY").await {
         providers.register(
             "together",
             Arc::new(OpenAICompatibleProvider::new(
@@ -166,7 +195,7 @@ fn register_openai_compatible_providers(providers: &mut ProviderRegistry) {
         );
     }
 
-    if let Ok(api_key) = std::env::var("XAI_API_KEY") {
+    if let Some(api_key) = secret("XAI_API_KEY").await {
         providers.register(
             "xai",
             Arc::new(OpenAICompatibleProvider::new(
@@ -177,7 +206,7 @@ fn register_openai_compatible_providers(providers: &mut ProviderRegistry) {
         );
     }
 
-    if let Ok(api_key) = std::env::var("MISTRAL_API_KEY") {
+    if let Some(api_key) = secret("MISTRAL_API_KEY").await {
         providers.register(
             "mistral",
             Arc::new(OpenAICompatibleProvider::new(
@@ -188,9 +217,7 @@ fn register_openai_compatible_providers(providers: &mut ProviderRegistry) {
         );
     }
 
-    if let Ok(api_key) =
-        std::env::var("MOONSHOT_API_KEY").or_else(|_| std::env::var("KIMI_API_KEY"))
-    {
+    if let Some(api_key) = secret_any(&["MOONSHOT_API_KEY", "KIMI_API_KEY"]).await {
         providers.register(
             "moonshot",
             Arc::new(OpenAICompatibleProvider::new(
@@ -201,9 +228,7 @@ fn register_openai_compatible_providers(providers: &mut ProviderRegistry) {
         );
     }
 
-    if let Ok(api_key) =
-        std::env::var("DASHSCOPE_API_KEY").or_else(|_| std::env::var("QWEN_API_KEY"))
-    {
+    if let Some(api_key) = secret_any(&["DASHSCOPE_API_KEY", "QWEN_API_KEY"]).await {
         providers.register(
             "qwen",
             Arc::new(OpenAICompatibleProvider::new(
@@ -217,7 +242,7 @@ fn register_openai_compatible_providers(providers: &mut ProviderRegistry) {
         );
     }
 
-    if let Ok(api_key) = std::env::var("ZHIPU_API_KEY").or_else(|_| std::env::var("GLM_API_KEY")) {
+    if let Some(api_key) = secret_any(&["ZHIPU_API_KEY", "GLM_API_KEY"]).await {
         providers.register(
             "zhipu",
             Arc::new(OpenAICompatibleProvider::new(
@@ -228,7 +253,7 @@ fn register_openai_compatible_providers(providers: &mut ProviderRegistry) {
         );
     }
 
-    if let Ok(api_key) = std::env::var("COHERE_API_KEY") {
+    if let Some(api_key) = secret("COHERE_API_KEY").await {
         providers.register(
             "cohere",
             Arc::new(OpenAICompatibleProvider::new(
@@ -242,7 +267,7 @@ fn register_openai_compatible_providers(providers: &mut ProviderRegistry) {
         );
     }
 
-    if let Ok(api_key) = std::env::var("OPENROUTER_API_KEY") {
+    if let Some(api_key) = secret("OPENROUTER_API_KEY").await {
         providers.register(
             "openrouter",
             Arc::new(OpenAICompatibleProvider::new(
@@ -259,7 +284,7 @@ fn register_openai_compatible_providers(providers: &mut ProviderRegistry) {
             Arc::new(OpenAICompatibleProvider::new(
                 env_or("CUSTOM_OPENAI_PROVIDER_NAME", "custom"),
                 base_url,
-                std::env::var("CUSTOM_OPENAI_API_KEY").ok(),
+                secret("CUSTOM_OPENAI_API_KEY").await,
             )),
         );
     }
@@ -277,7 +302,7 @@ fn register_openai_compatible_providers(providers: &mut ProviderRegistry) {
             Arc::new(OpenAICompatibleProvider::new(
                 "anthropic_compat",
                 base_url,
-                std::env::var("ANTHROPIC_COMPAT_API_KEY").ok(),
+                secret("ANTHROPIC_COMPAT_API_KEY").await,
             )),
         );
     }
@@ -285,4 +310,17 @@ fn register_openai_compatible_providers(providers: &mut ProviderRegistry) {
 
 fn env_or(name: &str, fallback: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| fallback.to_string())
+}
+
+async fn secret(name: &str) -> Option<String> {
+    crate::secrets::provider_secret(name).await
+}
+
+async fn secret_any(names: &[&str]) -> Option<String> {
+    for name in names {
+        if let Some(value) = secret(name).await {
+            return Some(value);
+        }
+    }
+    None
 }

@@ -16,12 +16,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::{
+    Router,
     body::Body,
     extract::{Query, State},
-    http::{header, HeaderMap, HeaderValue, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::get,
-    Router,
 };
 use serde::Deserialize;
 use tokio::sync::Mutex;
@@ -101,13 +101,30 @@ impl Default for InstallState {
 
 pub fn router(state: Arc<InstallState>) -> Router {
     Router::new()
-        .route("/install.sh", get(|| async { script_response(INSTALL_SH, "text/x-shellscript; charset=utf-8") }))
-        .route("/install.ps1", get(|| async { script_response(INSTALL_PS1, "text/plain; charset=utf-8") }))
-        .route("/install_gateway.sh", get(|| async { script_response(INSTALL_GATEWAY_SH, "text/x-shellscript; charset=utf-8") }))
-        .route("/install_gateway.ps1", get(|| async { script_response(INSTALL_GATEWAY_PS1, "text/plain; charset=utf-8") }))
+        .route(
+            "/install.sh",
+            get(|| async { script_response(INSTALL_SH, "text/x-shellscript; charset=utf-8") }),
+        )
+        .route(
+            "/install.ps1",
+            get(|| async { script_response(INSTALL_PS1, "text/plain; charset=utf-8") }),
+        )
+        .route(
+            "/install_gateway.sh",
+            get(|| async {
+                script_response(INSTALL_GATEWAY_SH, "text/x-shellscript; charset=utf-8")
+            }),
+        )
+        .route(
+            "/install_gateway.ps1",
+            get(|| async { script_response(INSTALL_GATEWAY_PS1, "text/plain; charset=utf-8") }),
+        )
         .route("/v1/install/binary", get(stream_binary))
         .route("/v1/install/transparency", get(fetch_transparency_entry))
-        .route("/v1/install/transparency-root", get(fetch_transparency_root))
+        .route(
+            "/v1/install/transparency-root",
+            get(fetch_transparency_root),
+        )
         .with_state(state)
 }
 
@@ -144,7 +161,7 @@ async fn stream_binary(
             return error_response(
                 StatusCode::BAD_REQUEST,
                 "os must be 'linux', 'darwin', or 'windows'",
-            )
+            );
         }
     };
     let arch = match q.arch.as_str() {
@@ -251,7 +268,7 @@ async fn fetch_sha256(client: &reqwest::Client, url: &str, token: &str) -> Optio
 
 /// Fetch <binary>.sig (raw 64-byte Ed25519 sig) from GCS, return as base64.
 async fn fetch_signature(client: &reqwest::Client, url: &str, token: &str) -> Option<String> {
-    use base64::{engine::general_purpose::STANDARD as B64, Engine};
+    use base64::{Engine, engine::general_purpose::STANDARD as B64};
     let resp = client
         .get(url)
         .bearer_auth(token)
@@ -324,16 +341,32 @@ async fn fetch_transparency_entry(
         return error_response(StatusCode::BAD_GATEWAY, "transparency log list failed");
     }
     #[derive(Deserialize)]
-    struct ListItem { name: String }
+    struct ListItem {
+        name: String,
+    }
     #[derive(Deserialize)]
-    struct ListResp { #[serde(default)] items: Vec<ListItem> }
+    struct ListResp {
+        #[serde(default)]
+        items: Vec<ListItem>,
+    }
     let parsed: ListResp = match list.json().await {
         Ok(p) => p,
         Err(_) => return error_response(StatusCode::BAD_GATEWAY, "transparency log parse failed"),
     };
-    let entry_name = match parsed.items.iter().map(|i| i.name.as_str()).filter(|n| n.ends_with(".json")).max() {
+    let entry_name = match parsed
+        .items
+        .iter()
+        .map(|i| i.name.as_str())
+        .filter(|n| n.ends_with(".json"))
+        .max()
+    {
         Some(n) => n.to_string(),
-        None => return error_response(StatusCode::NOT_FOUND, "no transparency log entry for this sha256"),
+        None => {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                "no transparency log entry for this sha256",
+            );
+        }
     };
     let sig_name = format!("{entry_name}.sig");
     let entry_url = format!("https://storage.googleapis.com/{TRANSPARENCY_BUCKET}/{entry_name}");
@@ -343,18 +376,30 @@ async fn fetch_transparency_entry(
         state.client.get(&sig_url).send(),
     );
     let entry_body = match entry_resp {
-        Ok(r) if r.status().is_success() => match r.text().await { Ok(t) => t, Err(_) => return error_response(StatusCode::BAD_GATEWAY, "entry body unreadable") },
+        Ok(r) if r.status().is_success() => match r.text().await {
+            Ok(t) => t,
+            Err(_) => return error_response(StatusCode::BAD_GATEWAY, "entry body unreadable"),
+        },
         _ => return error_response(StatusCode::BAD_GATEWAY, "entry fetch failed"),
     };
     let sig_bytes = match sig_resp {
-        Ok(r) if r.status().is_success() => match r.bytes().await { Ok(b) => b, Err(_) => return error_response(StatusCode::BAD_GATEWAY, "sig body unreadable") },
+        Ok(r) if r.status().is_success() => match r.bytes().await {
+            Ok(b) => b,
+            Err(_) => return error_response(StatusCode::BAD_GATEWAY, "sig body unreadable"),
+        },
         _ => return error_response(StatusCode::BAD_GATEWAY, "sig fetch failed"),
     };
     if sig_bytes.len() != 64 {
-        return error_response(StatusCode::BAD_GATEWAY, "transparency log entry signature malformed");
+        return error_response(
+            StatusCode::BAD_GATEWAY,
+            "transparency log entry signature malformed",
+        );
     }
-    use base64::{engine::general_purpose::STANDARD as B64, Engine};
-    let resp = TransparencyResponse { entry: entry_body, signature: B64.encode(&sig_bytes) };
+    use base64::{Engine, engine::general_purpose::STANDARD as B64};
+    let resp = TransparencyResponse {
+        entry: entry_body,
+        signature: B64.encode(&sig_bytes),
+    };
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/json")],
@@ -366,28 +411,41 @@ async fn fetch_transparency_entry(
 /// Latest witness-signed log root. Body = canonical root JSON; signature in
 /// X-Witness-Signature header. 404 when no root has been published yet.
 async fn fetch_transparency_root(State(state): State<Arc<InstallState>>) -> Response {
-    let root_url = format!("https://storage.googleapis.com/{TRANSPARENCY_BUCKET}/roots/latest-root.json");
-    let sig_url = format!("https://storage.googleapis.com/{TRANSPARENCY_BUCKET}/roots/latest-root.json.sig");
+    let root_url =
+        format!("https://storage.googleapis.com/{TRANSPARENCY_BUCKET}/roots/latest-root.json");
+    let sig_url =
+        format!("https://storage.googleapis.com/{TRANSPARENCY_BUCKET}/roots/latest-root.json.sig");
     let (root_resp, sig_resp) = tokio::join!(
         state.client.get(&root_url).send(),
         state.client.get(&sig_url).send(),
     );
     let root_body = match root_resp {
-        Ok(r) if r.status().is_success() => match r.bytes().await { Ok(b) => b, Err(_) => return error_response(StatusCode::BAD_GATEWAY, "root body unreadable") },
-        Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => return error_response(StatusCode::NOT_FOUND, "no witness-signed root yet"),
+        Ok(r) if r.status().is_success() => match r.bytes().await {
+            Ok(b) => b,
+            Err(_) => return error_response(StatusCode::BAD_GATEWAY, "root body unreadable"),
+        },
+        Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => {
+            return error_response(StatusCode::NOT_FOUND, "no witness-signed root yet");
+        }
         _ => return error_response(StatusCode::BAD_GATEWAY, "root fetch failed"),
     };
     let sig_bytes = match sig_resp {
-        Ok(r) if r.status().is_success() => match r.bytes().await { Ok(b) => b, Err(_) => return error_response(StatusCode::BAD_GATEWAY, "root sig unreadable") },
+        Ok(r) if r.status().is_success() => match r.bytes().await {
+            Ok(b) => b,
+            Err(_) => return error_response(StatusCode::BAD_GATEWAY, "root sig unreadable"),
+        },
         _ => return error_response(StatusCode::BAD_GATEWAY, "root sig fetch failed"),
     };
     if sig_bytes.len() != 64 {
         return error_response(StatusCode::BAD_GATEWAY, "witness signature malformed");
     }
-    use base64::{engine::general_purpose::STANDARD as B64, Engine};
+    use base64::{Engine, engine::general_purpose::STANDARD as B64};
     let sig_b64 = B64.encode(&sig_bytes);
     let mut headers = HeaderMap::new();
-    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
     if let Ok(v) = HeaderValue::from_str(&sig_b64) {
         headers.insert("x-witness-signature", v);
     }
