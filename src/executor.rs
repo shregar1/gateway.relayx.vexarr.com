@@ -1,11 +1,17 @@
 use std::time::Instant;
 
+use futures_util::StreamExt;
+
 use crate::{
     auth::AuthContext,
+    budget::BudgetStatus,
     cache,
     errors::{GatewayError, ProviderErrorKind, RetryDecision},
+    guardrails::{self, GuardrailAction},
     logs::{self, RequestLog},
+    metrics::METRICS,
     providers::{ChatCompletionRequest, ChatCompletionResponse, ProviderRequest, ProviderStream},
+    semantic_cache,
     state::AppState,
     usage,
 };
@@ -24,25 +30,101 @@ pub struct ExecutionResult {
 pub async fn execute_chat(
     state: &AppState,
     context: &ExecutionContext,
-    request: ChatCompletionRequest,
+    mut request: ChatCompletionRequest,
 ) -> Result<ExecutionResult, GatewayError> {
+    // ── Guardrails: scan for PII before anything else ─────────────
+    let (guardrail_action, sanitized) =
+        guardrails::scan_messages(&request.messages, state.guardrail_mode);
+    match &guardrail_action {
+        GuardrailAction::Blocked(detections) => {
+            METRICS.guardrail_blocked.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let kinds: Vec<_> = detections.iter().map(|d| format!("{:?}", d.kind)).collect();
+            return Err(GatewayError::BadRequest(format!(
+                "request blocked by guardrails: detected {}",
+                kinds.join(", ")
+            )));
+        }
+        GuardrailAction::Redacted(_) => {
+            METRICS.guardrail_redacted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            request.messages = sanitized;
+        }
+        GuardrailAction::Allow => {}
+    }
+
+    // ── Budget check ──────────────────────────────────────────────
+    let budget_status = state
+        .budget
+        .check(&context.auth.tenant_id, &context.auth.project_id)
+        .await;
+    match &budget_status {
+        BudgetStatus::Exceeded { .. } => {
+            METRICS.budget_exceeded.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(GatewayError::RateLimited {
+                scope: "budget",
+                limit: 0,
+                remaining: 0,
+                reset_after_secs: seconds_until_midnight(),
+            });
+        }
+        BudgetStatus::NearLimit {
+            downgrade_model, ..
+        } => {
+            METRICS.budget_downgraded.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!(
+                tenant = %context.auth.tenant_id,
+                original_model = %request.model,
+                downgrade_model = %downgrade_model,
+                "budget near limit — downgrading model"
+            );
+            request.model = downgrade_model.clone();
+        }
+        BudgetStatus::Ok => {}
+    }
+
+    // ── Cache lookup (exact → semantic) ───────────────────────────
     if cache::is_cacheable(&request) {
         let key = cache::cache_key(&context.auth.tenant_id, &context.auth.project_id, &request);
         if let Some(mut response) = state.cache.get(&key).await? {
             if let Some(relayx) = &mut response.relayx {
                 relayx.cache = "hit".to_string();
             }
+            METRICS.record_request(true, 0, "hit");
             return Ok(ExecutionResult {
                 response,
                 cache_status: "hit".to_string(),
             });
         }
+
+        if let Some(mut response) = state
+            .semantic_cache
+            .lookup(
+                &context.auth.tenant_id,
+                &context.auth.project_id,
+                &request.model,
+                &request.messages,
+                semantic_cache::semantic_cache_threshold(),
+            )
+            .await
+        {
+            if let Some(relayx) = &mut response.relayx {
+                relayx.cache = "semantic_hit".to_string();
+            }
+            METRICS.record_request(true, 0, "semantic_hit");
+            return Ok(ExecutionResult {
+                response,
+                cache_status: "semantic_hit".to_string(),
+            });
+        }
     }
+
+    // ── Smart routing: sort candidates by latency-weighted score ──
+    let mut candidates = state.routing.candidates(&request.model)?;
+    state.health.sort_by_score(&mut candidates);
 
     let started = Instant::now();
     let mut last_error = None;
 
-    for provider_request in state.routing.candidates(&request.model)? {
+    for provider_request in &candidates {
         if !state.health.is_available(&provider_request.provider) {
             last_error = Some(format!(
                 "provider `{}` circuit breaker is open",
@@ -51,11 +133,30 @@ pub async fn execute_chat(
             continue;
         }
 
-        match execute_candidate(state, &provider_request, request.clone()).await {
+        let call_start = Instant::now();
+        match execute_candidate(state, provider_request, request.clone()).await {
             Ok(response) => {
+                let latency = call_start.elapsed();
                 state.health.record_success(&provider_request.provider);
-                let usage_event =
-                    usage::build_usage_event(&request, response.usage.completion_tokens);
+                state
+                    .health
+                    .record_latency(&provider_request.provider, latency);
+
+                let usage_event = usage::build_usage_event(
+                    &request,
+                    response.usage.completion_tokens,
+                    &provider_request.provider,
+                    &provider_request.provider_model,
+                );
+
+                state
+                    .budget
+                    .record_spend(
+                        &context.auth.tenant_id,
+                        &context.auth.project_id,
+                        usage_event.estimated_cost_usd,
+                    )
+                    .await;
 
                 let log = RequestLog {
                     request_id: context.request_id.clone(),
@@ -81,6 +182,9 @@ pub async fn execute_chat(
                     error: None,
                 };
                 state.logs.push(log.clone());
+                METRICS.record_request(true, started.elapsed().as_millis(), "miss");
+                METRICS.record_tokens(usage_event.prompt_tokens, usage_event.completion_tokens);
+                METRICS.record_cost(usage_event.estimated_cost_usd);
                 emit_platform_events(state, "relayx.request.completed", log);
 
                 if cache::is_cacheable(&request) {
@@ -93,6 +197,17 @@ pub async fn execute_chat(
                         .cache
                         .insert(key, response.clone(), cache::default_ttl())
                         .await?;
+
+                    state
+                        .semantic_cache
+                        .store(
+                            &context.auth.tenant_id,
+                            &context.auth.project_id,
+                            &request.model,
+                            &request.messages,
+                            response.clone(),
+                        )
+                        .await;
                 }
 
                 return Ok(ExecutionResult {
@@ -101,6 +216,9 @@ pub async fn execute_chat(
                 });
             }
             Err(error) => {
+                state
+                    .health
+                    .record_latency(&provider_request.provider, call_start.elapsed());
                 if error.trips_circuit() {
                     state.health.record_failure(&provider_request.provider);
                 }
@@ -137,6 +255,7 @@ pub async fn execute_chat(
         error: Some(error.clone()),
     };
     state.logs.push(log.clone());
+    METRICS.record_request(false, started.elapsed().as_millis(), "miss");
     emit_platform_events(state, "relayx.request.failed", log);
 
     Err(GatewayError::Provider {
@@ -157,11 +276,30 @@ fn emit_platform_events(state: &AppState, event_type: &'static str, log: Request
 
 pub async fn execute_stream(
     state: &AppState,
-    request: ChatCompletionRequest,
+    mut request: ChatCompletionRequest,
 ) -> Result<(ProviderRequest, ProviderStream), GatewayError> {
+    let (guardrail_action, sanitized) =
+        guardrails::scan_messages(&request.messages, state.guardrail_mode);
+    match &guardrail_action {
+        GuardrailAction::Blocked(detections) => {
+            let kinds: Vec<_> = detections.iter().map(|d| format!("{:?}", d.kind)).collect();
+            return Err(GatewayError::BadRequest(format!(
+                "request blocked by guardrails: detected {}",
+                kinds.join(", ")
+            )));
+        }
+        GuardrailAction::Redacted(_) => {
+            request.messages = sanitized;
+        }
+        GuardrailAction::Allow => {}
+    }
+
+    let mut candidates = state.routing.candidates(&request.model)?;
+    state.health.sort_by_score(&mut candidates);
+
     let mut last_error = None;
 
-    for provider_request in state.routing.candidates(&request.model)? {
+    for provider_request in candidates {
         if !state.health.is_available(&provider_request.provider) {
             last_error = Some(format!(
                 "provider `{}` circuit breaker is open",
@@ -178,15 +316,38 @@ pub async fn execute_stream(
             continue;
         };
 
+        let call_start = Instant::now();
         match provider
             .stream_chat_completion(&provider_request, request.clone())
             .await
         {
             Ok(stream) => {
                 state.health.record_success(&provider_request.provider);
-                return Ok((provider_request, stream));
+                state
+                    .health
+                    .record_latency(&provider_request.provider, call_start.elapsed());
+
+                let health = state.health.clone();
+                let provider_name = provider_request.provider.clone();
+                let logged_stream = stream.inspect(move |result| {
+                    if let Err(error) = result {
+                        tracing::warn!(
+                            provider = %provider_name,
+                            error = %error,
+                            "stream chunk error"
+                        );
+                        if error.trips_circuit() {
+                            health.record_failure(&provider_name);
+                        }
+                    }
+                });
+
+                return Ok((provider_request, Box::pin(logged_stream)));
             }
             Err(error) => {
+                state
+                    .health
+                    .record_latency(&provider_request.provider, call_start.elapsed());
                 if error.trips_circuit() {
                     state.health.record_failure(&provider_request.provider);
                 }
@@ -219,4 +380,13 @@ async fn execute_candidate(
     };
 
     provider.chat_completion(provider_request, request).await
+}
+
+fn seconds_until_midnight() -> u64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let secs_today = now % 86400;
+    86400 - secs_today
 }

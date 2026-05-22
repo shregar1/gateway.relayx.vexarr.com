@@ -9,6 +9,8 @@ use serde::Serialize;
 pub enum GatewayError {
     #[error("unauthorized: {0}")]
     Unauthorized(String),
+    #[error("forbidden: insufficient scope `{scope}`")]
+    Forbidden { scope: &'static str },
     #[error("bad request: {0}")]
     BadRequest(String),
     #[error("rate limited: {scope} exceeded {limit} requests")]
@@ -134,6 +136,12 @@ impl IntoResponse for GatewayError {
                 "authentication_error",
                 "unauthorized",
                 message,
+            ),
+            GatewayError::Forbidden { scope } => (
+                StatusCode::FORBIDDEN,
+                "authorization_error",
+                "forbidden",
+                format!("insufficient permissions — requires scope `{scope}`"),
             ),
             GatewayError::BadRequest(message) => (
                 StatusCode::BAD_REQUEST,

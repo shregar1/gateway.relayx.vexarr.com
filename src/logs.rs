@@ -30,21 +30,34 @@ pub struct RequestLog {
     pub error: Option<String>,
 }
 
+/// Trait for pluggable log storage backends.
+/// Implementations must be Send + Sync for use behind Arc in AppState.
+pub trait LogStore: Send + Sync {
+    /// Append a log entry. Implementations may persist asynchronously.
+    fn push(&self, log: RequestLog);
+
+    /// Return the most recent `limit` entries (newest first).
+    fn recent(&self, limit: usize) -> Vec<RequestLog>;
+}
+
+/// In-memory ring-buffer log store (default when no database is configured).
 #[derive(Clone)]
-pub struct RequestLogStore {
+pub struct MemoryLogStore {
     entries: Arc<RwLock<VecDeque<RequestLog>>>,
     capacity: usize,
 }
 
-impl RequestLogStore {
+impl MemoryLogStore {
     pub fn new(capacity: usize) -> Self {
         Self {
             entries: Arc::new(RwLock::new(VecDeque::with_capacity(capacity))),
             capacity,
         }
     }
+}
 
-    pub fn push(&self, log: RequestLog) {
+impl LogStore for MemoryLogStore {
+    fn push(&self, log: RequestLog) {
         if let Ok(mut entries) = self.entries.write() {
             while entries.len() >= self.capacity {
                 entries.pop_front();
@@ -53,11 +66,10 @@ impl RequestLogStore {
         }
     }
 
-    pub fn recent(&self, limit: usize) -> Vec<RequestLog> {
+    fn recent(&self, limit: usize) -> Vec<RequestLog> {
         let Ok(entries) = self.entries.read() else {
             return vec![];
         };
-
         entries.iter().rev().take(limit).cloned().collect()
     }
 }

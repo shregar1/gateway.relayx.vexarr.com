@@ -113,6 +113,11 @@ impl KeyxAuthenticator {
 
     fn store(&self, key: String, value: CachedValidation) {
         if let Ok(mut cache) = self.cache.lock() {
+            // Prune expired entries periodically to prevent memory leaks
+            if cache.len() > 1_000 {
+                let now = Instant::now();
+                cache.retain(|_, v| now < v.expires_at);
+            }
             cache.insert(key, value);
         }
     }

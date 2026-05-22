@@ -60,8 +60,14 @@ impl SecretProvider for SecretxProvider {
         }
 
         if !response.status().is_success() {
+            tracing::warn!(
+                status = %response.status(),
+                scope = %scope,
+                name = %name,
+                "secretx lookup returned non-success status"
+            );
             return Err(GatewayError::Internal(format!(
-                "secretx returned {} for {scope}/{name}",
+                "secretx returned {} for requested secret",
                 response.status()
             )));
         }

@@ -36,6 +36,7 @@ const INSTALL_SH: &str = include_str!("../../assets/install/install.sh");
 const INSTALL_PS1: &str = include_str!("../../assets/install/install.ps1");
 const INSTALL_GATEWAY_SH: &str = include_str!("../../assets/install/install_gateway.sh");
 const INSTALL_GATEWAY_PS1: &str = include_str!("../../assets/install/install_gateway.ps1");
+const QUICKSTART_SH: &str = include_str!("../../assets/install/quickstart.sh");
 
 #[derive(Default)]
 struct TokenCache {
@@ -118,6 +119,12 @@ pub fn router(state: Arc<InstallState>) -> Router {
         .route(
             "/install_gateway.ps1",
             get(|| async { script_response(INSTALL_GATEWAY_PS1, "text/plain; charset=utf-8") }),
+        )
+        .route(
+            "/quickstart.sh",
+            get(|| async {
+                script_response(QUICKSTART_SH, "text/x-shellscript; charset=utf-8")
+            }),
         )
         .route("/v1/install/binary", get(stream_binary))
         .route("/v1/install/transparency", get(fetch_transparency_entry))

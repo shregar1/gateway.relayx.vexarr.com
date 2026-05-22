@@ -1,10 +1,11 @@
 use std::collections::HashMap;
+use std::sync::RwLock;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{errors::GatewayError, providers::ProviderRequest};
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteTarget {
     pub alias: String,
     pub provider: String,
@@ -12,15 +13,23 @@ pub struct RouteTarget {
     pub failover: Vec<RouteCandidate>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteCandidate {
     pub provider: String,
     pub provider_model: String,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct RoutingEngine {
-    routes: HashMap<String, RouteTarget>,
+    routes: RwLock<HashMap<String, RouteTarget>>,
+}
+
+impl Default for RoutingEngine {
+    fn default() -> Self {
+        Self {
+            routes: RwLock::new(HashMap::new()),
+        }
+    }
 }
 
 impl RoutingEngine {
@@ -172,12 +181,150 @@ impl RoutingEngine {
         insert_route(
             &mut routes,
             "deepseek",
-            "together",
-            "deepseek-ai/DeepSeek-V3",
+            "deepseek",
+            "deepseek-chat",
             &[
+                ("siliconflow", "deepseek-ai/DeepSeek-V3"),
+                ("together", "deepseek-ai/DeepSeek-V3"),
                 ("openrouter", "deepseek/deepseek-chat"),
-                ("ollama", "deepseek-r1"),
+                ("ollama", "deepseek-v3"),
                 ("mock", "deepseek"),
+            ],
+        );
+
+        insert_route(
+            &mut routes,
+            "deepseek-r1",
+            "deepseek",
+            "deepseek-reasoner",
+            &[
+                ("siliconflow", "deepseek-ai/DeepSeek-R1"),
+                ("together", "deepseek-ai/DeepSeek-R1"),
+                ("openrouter", "deepseek/deepseek-r1"),
+                ("ollama", "deepseek-r1"),
+                ("mock", "deepseek-r1"),
+            ],
+        );
+
+        insert_route(
+            &mut routes,
+            "deepseek-coder",
+            "deepseek",
+            "deepseek-coder",
+            &[
+                ("siliconflow", "deepseek-ai/DeepSeek-Coder-V2-Instruct"),
+                ("openrouter", "deepseek/deepseek-coder"),
+                ("mock", "deepseek-coder"),
+            ],
+        );
+
+        insert_route(
+            &mut routes,
+            "qwen-max",
+            "qwen",
+            "qwen-max",
+            &[
+                ("openrouter", "qwen/qwen-max"),
+                ("siliconflow", "Qwen/Qwen2.5-72B-Instruct"),
+                ("mock", "qwen-max"),
+            ],
+        );
+
+        insert_route(
+            &mut routes,
+            "qwen-turbo",
+            "qwen",
+            "qwen-turbo",
+            &[
+                ("siliconflow", "Qwen/Qwen2.5-7B-Instruct"),
+                ("openrouter", "qwen/qwen-turbo"),
+                ("mock", "qwen-turbo"),
+            ],
+        );
+
+        insert_route(
+            &mut routes,
+            "qwen-coder",
+            "qwen",
+            "qwen-coder-plus",
+            &[
+                ("groq", "qwen/qwen3-coder"),
+                ("siliconflow", "Qwen/Qwen2.5-Coder-32B-Instruct"),
+                ("together", "Qwen/Qwen2.5-Coder-32B-Instruct"),
+                ("openrouter", "qwen/qwen-2.5-coder-32b-instruct"),
+                ("mock", "qwen-coder"),
+            ],
+        );
+
+        insert_route(
+            &mut routes,
+            "kimi-k2",
+            "moonshot",
+            "kimi-k2-latest",
+            &[
+                ("openrouter", "moonshotai/kimi-k2"),
+                ("groq", "moonshotai/kimi-k2-instruct"),
+                ("siliconflow", "Moonshotai/Kimi-K2"),
+                ("mock", "kimi-k2"),
+            ],
+        );
+
+        insert_route(
+            &mut routes,
+            "glm-4-plus",
+            "zhipu",
+            "glm-4-plus",
+            &[
+                ("openrouter", "z-ai/glm-4-plus"),
+                ("siliconflow", "THUDM/GLM-4-Plus"),
+                ("mock", "glm-4-plus"),
+            ],
+        );
+
+        insert_route(
+            &mut routes,
+            "yi-lightning",
+            "yi",
+            "yi-lightning",
+            &[
+                ("siliconflow", "01-ai/Yi-1.5-34B-Chat"),
+                ("openrouter", "01-ai/yi-large"),
+                ("mock", "yi-lightning"),
+            ],
+        );
+
+        insert_route(
+            &mut routes,
+            "baichuan",
+            "baichuan",
+            "Baichuan4-Air",
+            &[
+                ("siliconflow", "baichuan-inc/Baichuan4"),
+                ("openrouter", "baichuan/baichuan-4"),
+                ("mock", "baichuan"),
+            ],
+        );
+
+        insert_route(
+            &mut routes,
+            "minimax",
+            "minimax",
+            "MiniMax-Text-01",
+            &[
+                ("openrouter", "minimax/minimax-01"),
+                ("mock", "minimax"),
+            ],
+        );
+
+        insert_route(
+            &mut routes,
+            "step",
+            "stepfun",
+            "step-2-16k",
+            &[
+                ("siliconflow", "stepfun/Step-2-16K"),
+                ("openrouter", "stepfun/step-2"),
+                ("mock", "step"),
             ],
         );
 
@@ -187,17 +334,22 @@ impl RoutingEngine {
             "groq",
             "qwen/qwen3-coder",
             &[
+                ("qwen", "qwen-coder-plus"),
+                ("deepseek", "deepseek-coder"),
                 ("together", "Qwen/Qwen2.5-Coder-32B-Instruct"),
                 ("openrouter", "qwen/qwen-2.5-coder-32b-instruct"),
                 ("mock", "code-model"),
             ],
         );
 
-        Self { routes }
+        Self {
+            routes: RwLock::new(routes),
+        }
     }
 
     pub fn select(&self, model: &str) -> Result<RouteTarget, GatewayError> {
-        self.routes
+        let routes = self.routes.read().unwrap();
+        routes
             .get(model)
             .cloned()
             .ok_or_else(|| GatewayError::NoRoute(model.to_string()))
@@ -229,15 +381,45 @@ impl RoutingEngine {
     }
 
     pub fn models(&self) -> Vec<String> {
-        let mut models = self.routes.keys().cloned().collect::<Vec<_>>();
+        let routes = self.routes.read().unwrap();
+        let mut models = routes.keys().cloned().collect::<Vec<_>>();
         models.sort();
         models
     }
 
     pub fn routes(&self) -> Vec<RouteTarget> {
-        let mut routes = self.routes.values().cloned().collect::<Vec<_>>();
-        routes.sort_by(|left, right| left.alias.cmp(&right.alias));
-        routes
+        let routes = self.routes.read().unwrap();
+        let mut out = routes.values().cloned().collect::<Vec<_>>();
+        out.sort_by(|left, right| left.alias.cmp(&right.alias));
+        out
+    }
+
+    // ── Dynamic mutation methods ─────────────────────────────
+
+    /// Insert or update a route. Returns the previous route if it existed.
+    pub fn upsert(&self, target: RouteTarget) -> Option<RouteTarget> {
+        let mut routes = self.routes.write().unwrap();
+        routes.insert(target.alias.clone(), target)
+    }
+
+    /// Remove a route by alias. Returns the removed route if it existed.
+    pub fn remove(&self, alias: &str) -> Option<RouteTarget> {
+        let mut routes = self.routes.write().unwrap();
+        routes.remove(alias)
+    }
+
+    /// Bulk-insert routes (used when loading from DB at startup).
+    pub fn load_routes(&self, targets: Vec<RouteTarget>) {
+        let mut routes = self.routes.write().unwrap();
+        for target in targets {
+            routes.insert(target.alias.clone(), target);
+        }
+    }
+
+    /// Number of registered routes.
+    pub fn count(&self) -> usize {
+        let routes = self.routes.read().unwrap();
+        routes.len()
     }
 }
 
@@ -277,8 +459,13 @@ mod tests {
         for alias in [
             "llama",
             "kimi",
+            "kimi-k2",
             "qwen",
+            "qwen-max",
+            "qwen-turbo",
+            "qwen-coder",
             "glm",
+            "glm-4-plus",
             "mistral",
             "cohere",
             "grok",
@@ -286,6 +473,12 @@ mod tests {
             "gemini-long",
             "bedrock-claude",
             "deepseek",
+            "deepseek-r1",
+            "deepseek-coder",
+            "yi-lightning",
+            "baichuan",
+            "minimax",
+            "step",
             "code-model",
         ] {
             assert!(models.contains(&alias.to_string()), "missing alias {alias}");

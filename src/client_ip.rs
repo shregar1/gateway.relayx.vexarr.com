@@ -15,11 +15,12 @@ pub async fn inject_internal_client_ip(
     if !request
         .headers()
         .contains_key("x-relayx-internal-client-ip")
-        && let Ok(value) = HeaderValue::from_str(&peer_addr.ip().to_string())
     {
-        request
-            .headers_mut()
-            .insert("x-relayx-internal-client-ip", value);
+        if let Ok(value) = HeaderValue::from_str(&peer_addr.ip().to_string()) {
+            request
+                .headers_mut()
+                .insert("x-relayx-internal-client-ip", value);
+        }
     }
 
     next.run(request).await

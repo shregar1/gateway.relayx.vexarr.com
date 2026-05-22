@@ -21,12 +21,161 @@ pub struct ChatCompletionRequest {
     pub temperature: Option<f32>,
     #[serde(default)]
     pub max_tokens: Option<u32>,
+
+    /// Tool definitions the model may call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<ToolDefinition>>,
+
+    /// How the model should choose tools ("none", "auto", "required", or specific).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<ToolChoice>,
+
+    /// Whether the model can issue tool calls in parallel (default: true).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
 }
 
+/// A single message in the conversation.
+///
+/// `content` is optional because tool-call assistant messages may only contain
+/// `tool_calls` and no textual content.  We use a flexible `MessageContent`
+/// enum so callers can send either a plain string or an array of typed content
+/// blocks (text, image_url, …) — matching the OpenAI multimodal format.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ChatMessage {
     pub role: String,
-    pub content: String,
+
+    /// Text content of the message.  `None` for pure tool-call assistant turns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<MessageContent>,
+
+    /// For role = "assistant": tool calls the model wants to make.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+
+    /// For role = "tool": which tool call this message is the result for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+
+    /// For role = "tool" or "function": the name of the function.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+impl ChatMessage {
+    /// Convenience: create a simple text message (most common case).
+    pub fn text(role: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            content: Some(MessageContent::Text(content.into())),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
+    /// Return the text content as a string ref, or "" if absent / not text.
+    pub fn content_text(&self) -> &str {
+        match &self.content {
+            Some(MessageContent::Text(s)) => s.as_str(),
+            Some(MessageContent::Blocks(blocks)) => {
+                // Return the first text block's content
+                for block in blocks {
+                    if let ContentBlock::Text { text } = block {
+                        return text.as_str();
+                    }
+                }
+                ""
+            }
+            None => "",
+        }
+    }
+}
+
+// ── Flexible message content ────────────────────────────────────
+
+/// Content can be a plain string (95% of cases) or an array of typed blocks
+/// for multimodal inputs (images, audio, etc.).
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(untagged)]
+pub enum MessageContent {
+    /// Simple text content: `"content": "Hello"`
+    Text(String),
+    /// Array of content blocks: `"content": [{"type":"text","text":"Hi"}, {"type":"image_url",...}]`
+    Blocks(Vec<ContentBlock>),
+}
+
+/// A single block inside a multi-part message content array.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(tag = "type")]
+pub enum ContentBlock {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "image_url")]
+    ImageUrl { image_url: ImageUrlBlock },
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ImageUrlBlock {
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+// ── Tool definitions ────────────────────────────────────────────
+
+/// A tool the model may call (currently only "function" type).
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ToolDefinition {
+    #[serde(rename = "type")]
+    pub tool_type: String,
+    pub function: FunctionDefinition,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct FunctionDefinition {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
+}
+
+/// A tool call made by the model.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub call_type: String,
+    pub function: FunctionCall,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct FunctionCall {
+    pub name: String,
+    pub arguments: String,
+}
+
+/// Specifies how the model should pick tools. Can be "none", "auto",
+/// "required", or `{"type":"function","function":{"name":"..."}}`.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(untagged)]
+pub enum ToolChoice {
+    /// "none", "auto", or "required"
+    Mode(String),
+    /// Force a specific function
+    Specific {
+        #[serde(rename = "type")]
+        choice_type: String,
+        function: ToolChoiceFunction,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ToolChoiceFunction {
+    pub name: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -46,6 +195,9 @@ pub struct ChatChoice {
     pub index: usize,
     pub message: ChatMessage,
     pub finish_reason: String,
+    /// Present when the model stops due to a tool call (finish_reason = "tool_calls").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -78,6 +230,35 @@ pub struct ProviderRequest {
     pub failover: Vec<RouteCandidate>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct EmbedRequest {
+    pub model: String,
+    pub input: Vec<String>,
+    #[serde(default)]
+    pub dimensions: Option<usize>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct EmbedResponse {
+    pub object: String,
+    pub data: Vec<EmbedData>,
+    pub model: String,
+    pub usage: EmbedUsage,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct EmbedData {
+    pub object: String,
+    pub embedding: Vec<f32>,
+    pub index: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct EmbedUsage {
+    pub prompt_tokens: u32,
+    pub total_tokens: u32,
+}
+
 #[async_trait]
 pub trait ProviderAdapter: Send + Sync {
     async fn chat_completion(
@@ -91,6 +272,17 @@ pub trait ProviderAdapter: Send + Sync {
         route: &ProviderRequest,
         request: ChatCompletionRequest,
     ) -> Result<ProviderStream, GatewayError>;
+
+    /// Generate embeddings. Returns an error by default for providers that don't support it.
+    async fn embed(
+        &self,
+        _model: &str,
+        _request: EmbedRequest,
+    ) -> Result<EmbedResponse, GatewayError> {
+        Err(GatewayError::BadRequest(
+            "this provider does not support embeddings".to_string(),
+        ))
+    }
 }
 
 #[derive(Default)]
@@ -149,11 +341,9 @@ impl ProviderAdapter for MockProvider {
             model: route.route_alias.clone(),
             choices: vec![ChatChoice {
                 index: 0,
-                message: ChatMessage {
-                    role: "assistant".to_string(),
-                    content: completion,
-                },
+                message: ChatMessage::text("assistant", completion),
                 finish_reason: "stop".to_string(),
+                tool_calls: None,
             }],
             usage: TokenUsage {
                 prompt_tokens,
@@ -191,7 +381,7 @@ pub fn response_to_sse_stream(response: ChatCompletionResponse) -> ProviderStrea
     let content = response
         .choices
         .first()
-        .map(|choice| choice.message.content.clone())
+        .map(|choice| choice.message.content_text().to_string())
         .unwrap_or_default();
 
     let chunks = content
@@ -264,8 +454,21 @@ impl OpenAICompatibleProvider {
         format!("{}/chat/completions", self.base_url)
     }
 
+    fn embeddings_url(&self) -> String {
+        format!("{}/embeddings", self.base_url)
+    }
+
     fn request_builder(&self) -> reqwest::RequestBuilder {
         let builder = self.client.post(self.chat_url()).query(&self.query);
+        match &self.auth {
+            ProviderAuth::None => builder,
+            ProviderAuth::Bearer(api_key) => builder.bearer_auth(api_key),
+            ProviderAuth::ApiKeyHeader { name, value } => builder.header(name, value),
+        }
+    }
+
+    fn embed_request_builder(&self) -> reqwest::RequestBuilder {
+        let builder = self.client.post(self.embeddings_url()).query(&self.query);
         match &self.auth {
             ProviderAuth::None => builder,
             ProviderAuth::Bearer(api_key) => builder.bearer_auth(api_key),
@@ -283,6 +486,12 @@ struct UpstreamChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<ToolDefinition>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<ToolChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parallel_tool_calls: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -299,6 +508,8 @@ struct UpstreamChoice {
     index: Option<usize>,
     message: Option<ChatMessage>,
     finish_reason: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<ToolCall>>,
 }
 
 #[async_trait]
@@ -314,6 +525,9 @@ impl ProviderAdapter for OpenAICompatibleProvider {
             temperature: request.temperature,
             max_tokens: request.max_tokens,
             stream: false,
+            tools: request.tools.clone(),
+            tool_choice: request.tool_choice.clone(),
+            parallel_tool_calls: request.parallel_tool_calls,
         };
 
         let builder = self.request_builder().json(&upstream);
@@ -349,22 +563,37 @@ impl ProviderAdapter for OpenAICompatibleProvider {
             .choices
             .into_iter()
             .enumerate()
-            .map(|(fallback_index, choice)| ChatChoice {
-                index: choice.index.unwrap_or(fallback_index),
-                message: choice.message.unwrap_or(ChatMessage {
-                    role: "assistant".to_string(),
-                    content: "".to_string(),
-                }),
-                finish_reason: choice.finish_reason.unwrap_or_else(|| "stop".to_string()),
+            .map(|(fallback_index, choice)| {
+                // Merge tool_calls from the choice level and from inside the message
+                let tool_calls = choice.tool_calls.or_else(|| {
+                    choice.message.as_ref().and_then(|m| m.tool_calls.clone())
+                });
+                ChatChoice {
+                    index: choice.index.unwrap_or(fallback_index),
+                    message: choice.message.unwrap_or_else(|| ChatMessage::text("assistant", "")),
+                    finish_reason: choice.finish_reason.unwrap_or_else(|| {
+                        if tool_calls.is_some() { "tool_calls".to_string() } else { "stop".to_string() }
+                    }),
+                    tool_calls,
+                }
             })
             .collect::<Vec<_>>();
 
         let usage = upstream.usage.unwrap_or_else(|| {
+            tracing::warn!(
+                provider = %self.name,
+                "upstream response missing usage data — falling back to estimation"
+            );
             let prompt_tokens = crate::usage::estimate_prompt_tokens(&request);
+            let content = choices
+                .first()
+                .map(|c| c.message.content_text())
+                .unwrap_or("");
+            let completion_tokens = crate::usage::estimate_text_tokens(content);
             TokenUsage {
                 prompt_tokens,
-                completion_tokens: 0,
-                total_tokens: prompt_tokens,
+                completion_tokens,
+                total_tokens: prompt_tokens + completion_tokens,
             }
         });
 
@@ -408,6 +637,9 @@ impl ProviderAdapter for OpenAICompatibleProvider {
             temperature: request.temperature,
             max_tokens: request.max_tokens,
             stream: true,
+            tools: request.tools,
+            tool_choice: request.tool_choice,
+            parallel_tool_calls: request.parallel_tool_calls,
         };
 
         let builder = self.request_builder().json(&upstream);
@@ -433,6 +665,57 @@ impl ProviderAdapter for OpenAICompatibleProvider {
             .map(move |chunk| chunk.map_err(|error| reqwest_error(&provider, error)));
 
         Ok(Box::pin(stream))
+    }
+
+    async fn embed(
+        &self,
+        model: &str,
+        request: EmbedRequest,
+    ) -> Result<EmbedResponse, GatewayError> {
+        #[derive(Serialize)]
+        struct UpstreamEmbedRequest {
+            model: String,
+            input: Vec<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            dimensions: Option<usize>,
+        }
+
+        let upstream = UpstreamEmbedRequest {
+            model: model.to_string(),
+            input: request.input,
+            dimensions: request.dimensions,
+        };
+
+        let response = self
+            .embed_request_builder()
+            .json(&upstream)
+            .send()
+            .await
+            .map_err(|error| reqwest_error(&self.name, error))?;
+
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|error| reqwest_error(&self.name, error))?;
+
+        if !status.is_success() {
+            return Err(GatewayError::provider(
+                self.name.clone(),
+                format!("embeddings upstream returned {status}: {body}"),
+                ProviderErrorKind::from_status(status),
+            ));
+        }
+
+        let embed_response: EmbedResponse = serde_json::from_str(&body).map_err(|error| {
+            GatewayError::provider(
+                self.name.clone(),
+                format!("invalid embeddings response: {error}"),
+                ProviderErrorKind::InvalidResponse,
+            )
+        })?;
+
+        Ok(embed_response)
     }
 }
 

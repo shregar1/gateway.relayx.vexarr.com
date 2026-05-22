@@ -1,9 +1,13 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use serde_json::json;
 
 use crate::logs::RequestLog;
+
+/// Timeout for integration HTTP calls (webhookx, billx, auditx, cronx) to prevent
+/// resource exhaustion when downstream services hang.
+const INTEGRATION_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[async_trait]
 pub trait EventPublisher: Send + Sync {
@@ -73,7 +77,10 @@ impl WebhookxEventPublisher {
             "RELAYX_WEBHOOKX_APPLICATION_URN",
         ])?;
         Some(Self {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(INTEGRATION_TIMEOUT)
+                .build()
+                .unwrap_or_default(),
             base_url: base_url.trim_end_matches('/').to_string(),
             application_urn,
             service_api_key: env_any(&["WEBHOOKX_SERVICE_API_KEY", "VEXARR_SERVICE_API_KEY"]),
@@ -125,7 +132,10 @@ impl BillxUsageMeter {
     pub fn from_env() -> Option<Self> {
         let base_url = env_any(&["BILLX_URL", "RELAYX_BILLX_URL"])?;
         Some(Self {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(INTEGRATION_TIMEOUT)
+                .build()
+                .unwrap_or_default(),
             base_url: base_url.trim_end_matches('/').to_string(),
             service_api_key: env_any(&["BILLX_SERVICE_API_KEY", "VEXARR_SERVICE_API_KEY"]),
         })
@@ -219,7 +229,10 @@ impl AuditxComplianceSink {
     pub fn from_env() -> Option<Self> {
         let base_url = env_any(&["AUDITX_URL", "VEXARR_AUDITX_URL", "RELAYX_AUDITX_URL"])?;
         Some(Self {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(INTEGRATION_TIMEOUT)
+                .build()
+                .unwrap_or_default(),
             base_url: base_url.trim_end_matches('/').to_string(),
             service_api_key: env_any(&["AUDITX_SERVICE_API_KEY", "VEXARR_SERVICE_API_KEY"]),
         })
@@ -270,7 +283,10 @@ impl CronxSchedulerIntegration {
             env_any(&["RELAYX_PUBLIC_GATEWAY_URL", "RELAYX_INTERNAL_GATEWAY_URL"])
                 .unwrap_or_else(|| "http://relayx-gateway:8080".to_string());
         Some(Self {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(INTEGRATION_TIMEOUT)
+                .build()
+                .unwrap_or_default(),
             base_url: base_url.trim_end_matches('/').to_string(),
             service_api_key: env_any(&["CRONX_SERVICE_API_KEY", "VEXARR_SERVICE_API_KEY"]),
             project_slug: std::env::var("RELAYX_CRONX_PROJECT_SLUG")

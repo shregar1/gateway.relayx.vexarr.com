@@ -4,15 +4,27 @@ use redis::AsyncCommands;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::{Arc, RwLock},
     time::Duration,
 };
 use tokio::time::timeout;
 
-#[derive(Clone, Default)]
+const LOCAL_CACHE_MAX_ENTRIES: usize = 10_000;
+
+#[derive(Clone)]
 pub struct LocalExactCache {
     entries: Arc<RwLock<HashMap<String, ChatCompletionResponse>>>,
+    insertion_order: Arc<RwLock<VecDeque<String>>>,
+}
+
+impl Default for LocalExactCache {
+    fn default() -> Self {
+        Self {
+            entries: Arc::new(RwLock::new(HashMap::new())),
+            insertion_order: Arc::new(RwLock::new(VecDeque::new())),
+        }
+    }
 }
 
 #[async_trait]
@@ -49,8 +61,26 @@ impl ExactCache for LocalExactCache {
         _ttl: Duration,
     ) -> Result<(), crate::errors::GatewayError> {
         if let Ok(mut entries) = self.entries.write() {
-            entries.insert(key, response);
+            // Evict oldest entries when cache exceeds capacity
+            if entries.len() >= LOCAL_CACHE_MAX_ENTRIES {
+                if let Ok(mut order) = self.insertion_order.write() {
+                    while entries.len() >= LOCAL_CACHE_MAX_ENTRIES {
+                        if let Some(oldest) = order.pop_front() {
+                            entries.remove(&oldest);
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            entries.insert(key.clone(), response);
         }
+
+        if let Ok(mut order) = self.insertion_order.write() {
+            order.push_back(key);
+        }
+
         Ok(())
     }
 }
@@ -83,9 +113,11 @@ impl ExactCache for RedisExactCache {
         key: &str,
     ) -> Result<Option<ChatCompletionResponse>, crate::errors::GatewayError> {
         let mut manager = self.manager.clone();
-        let value: Option<String> = manager
-            .get(redis_key(key))
+        let value: Option<String> = timeout(operation_timeout(), manager.get(redis_key(key)))
             .await
+            .map_err(|_| {
+                crate::errors::GatewayError::Internal("redis cache GET timed out".to_string())
+            })?
             .map_err(|error| crate::errors::GatewayError::Internal(error.to_string()))?;
 
         value
@@ -105,10 +137,15 @@ impl ExactCache for RedisExactCache {
         let mut manager = self.manager.clone();
         let value = serde_json::to_string(&response)
             .map_err(|error| crate::errors::GatewayError::Internal(error.to_string()))?;
-        let _: () = manager
-            .set_ex(redis_key(&key), value, ttl.as_secs())
-            .await
-            .map_err(|error| crate::errors::GatewayError::Internal(error.to_string()))?;
+        let _: () = timeout(
+            operation_timeout(),
+            manager.set_ex(redis_key(&key), value, ttl.as_secs()),
+        )
+        .await
+        .map_err(|_| {
+            crate::errors::GatewayError::Internal("redis cache SET timed out".to_string())
+        })?
+        .map_err(|error| crate::errors::GatewayError::Internal(error.to_string()))?;
         Ok(())
     }
 }
@@ -161,6 +198,10 @@ fn connection_timeout() -> Duration {
     Duration::from_secs(env_u64("RELAYX_REDIS_CONNECT_TIMEOUT_SECS", 5))
 }
 
+fn operation_timeout() -> Duration {
+    Duration::from_secs(env_u64("RELAYX_REDIS_OP_TIMEOUT_SECS", 3))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,13 +210,13 @@ mod tests {
     fn request(model: &str, temperature: Option<f32>) -> ChatCompletionRequest {
         ChatCompletionRequest {
             model: model.to_string(),
-            messages: vec![ChatMessage {
-                role: "user".to_string(),
-                content: "hello".to_string(),
-            }],
+            messages: vec![ChatMessage::text("user", "hello")],
             stream: false,
             temperature,
             max_tokens: Some(64),
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
         }
     }
 

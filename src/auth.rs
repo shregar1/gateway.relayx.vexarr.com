@@ -218,8 +218,171 @@ fn header_or_default(headers: &HeaderMap, name: &'static str, fallback: &'static
         .get(name)
         .and_then(|value| value.to_str().ok())
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or(fallback)
-        .to_string()
+        .map(|value| sanitize_identifier(value))
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+/// Sanitize tenant/project identifiers to prevent header injection.
+/// Only allows alphanumeric chars, hyphens, underscores, and dots.
+fn sanitize_identifier(value: &str) -> String {
+    let sanitized: String = value
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
+        .take(128)
+        .collect();
+    if sanitized.is_empty() {
+        "invalid".to_string()
+    } else {
+        sanitized
+    }
+}
+
+// ── JWT/OIDC Authenticator ────────────────────────────────────────
+
+/// Configuration for JWT-based authentication.
+#[derive(Debug, Clone)]
+pub struct JwtAuthConfig {
+    pub issuer: Option<String>,
+    pub audience: Option<String>,
+    pub secret: String,
+}
+
+impl JwtAuthConfig {
+    pub fn from_env() -> Result<Self, String> {
+        let secret = std::env::var("RELAYX_JWT_SECRET")
+            .map_err(|_| "RELAYX_JWT_SECRET is required for JWT auth mode")?;
+        if secret.len() < 16 {
+            return Err("RELAYX_JWT_SECRET must be at least 16 characters".to_string());
+        }
+        Ok(Self {
+            issuer: std::env::var("RELAYX_JWT_ISSUER").ok(),
+            audience: std::env::var("RELAYX_JWT_AUDIENCE").ok(),
+            secret,
+        })
+    }
+}
+
+pub struct JwtAuthenticator {
+    config: JwtAuthConfig,
+    decoding_key: jsonwebtoken::DecodingKey,
+}
+
+impl JwtAuthenticator {
+    pub fn new(config: JwtAuthConfig) -> Self {
+        let decoding_key =
+            jsonwebtoken::DecodingKey::from_secret(config.secret.as_bytes());
+        Self {
+            config,
+            decoding_key,
+        }
+    }
+}
+
+/// Standard JWT claims we extract.
+#[derive(Debug, serde::Deserialize)]
+struct JwtClaims {
+    /// Subject — maps to tenant_id
+    #[serde(default)]
+    sub: Option<String>,
+    /// Custom tenant ID (takes precedence over sub)
+    #[serde(default)]
+    tenant_id: Option<String>,
+    /// Project ID
+    #[serde(default)]
+    project_id: Option<String>,
+    /// Scopes as space-delimited string or array
+    #[serde(default)]
+    scope: Option<String>,
+    /// Array-form scopes
+    #[serde(default)]
+    scopes: Option<Vec<String>>,
+    /// Role
+    #[serde(default)]
+    role: Option<String>,
+    /// Environment
+    #[serde(default, rename = "env")]
+    environment: Option<String>,
+}
+
+#[async_trait]
+impl Authenticator for JwtAuthenticator {
+    async fn authenticate(
+        &self,
+        headers: &HeaderMap,
+        required_scope: &'static str,
+    ) -> Result<AuthContext, GatewayError> {
+        let token = bearer_token(headers)?;
+
+        let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
+        // Also accept HS384 and HS512
+        validation.algorithms = vec![
+            jsonwebtoken::Algorithm::HS256,
+            jsonwebtoken::Algorithm::HS384,
+            jsonwebtoken::Algorithm::HS512,
+        ];
+
+        if let Some(issuer) = &self.config.issuer {
+            validation.set_issuer(&[issuer]);
+        }
+
+        if let Some(audience) = &self.config.audience {
+            validation.set_audience(&[audience]);
+        }
+
+        let token_data = jsonwebtoken::decode::<JwtClaims>(token, &self.decoding_key, &validation)
+            .map_err(|e| {
+                GatewayError::Unauthorized(format!("invalid JWT: {e}"))
+            })?;
+
+        let claims = token_data.claims;
+
+        // Extract tenant_id: prefer explicit claim, fall back to sub
+        let tenant_id = claims
+            .tenant_id
+            .or(claims.sub)
+            .unwrap_or_else(|| "jwt_tenant".to_string());
+
+        let project_id = claims
+            .project_id
+            .unwrap_or_else(|| "default".to_string());
+
+        // Parse scopes from either space-delimited string or array
+        let scopes: Vec<String> = if let Some(scope_list) = claims.scopes {
+            scope_list
+        } else if let Some(scope_str) = claims.scope {
+            scope_str.split_whitespace().map(String::from).collect()
+        } else {
+            // Default: grant all standard scopes
+            vec![
+                "relayx:gateway:invoke".to_string(),
+                "relayx:models:read".to_string(),
+                "relayx:logs:read".to_string(),
+                "relayx:routing:read".to_string(),
+                "relayx:providers:read".to_string(),
+            ]
+        };
+
+        // Check required scope
+        if !scopes.iter().any(|s| s == required_scope || s == "relayx:admin" || s == "relayx:dev") {
+            return Err(GatewayError::Forbidden {
+                scope: required_scope,
+            });
+        }
+
+        let prefix = key_prefix(token);
+        enforce_ip_allowlist(&prefix, headers)?;
+
+        Ok(AuthContext {
+            api_key_prefix: prefix,
+            tenant_id,
+            project_id,
+            api_key_urn: None,
+            tenant_urn: None,
+            scopes,
+            role: claims.role,
+            environment: claims.environment,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -273,5 +436,124 @@ mod tests {
     #[test]
     fn key_prefix_uses_first_twelve_chars() {
         assert_eq!(key_prefix("rx_live_abcdef"), "rx_live_abcd");
+    }
+
+    #[tokio::test]
+    async fn jwt_auth_validates_valid_token() {
+        let secret = "test-secret-that-is-long-enough";
+        let config = JwtAuthConfig {
+            issuer: Some("relayx".to_string()),
+            audience: Some("gateway".to_string()),
+            secret: secret.to_string(),
+        };
+        let authenticator = JwtAuthenticator::new(config);
+
+        // Create a valid JWT
+        let claims = serde_json::json!({
+            "sub": "tenant_123",
+            "project_id": "proj_abc",
+            "scope": "relayx:gateway:invoke relayx:models:read",
+            "iss": "relayx",
+            "aud": "gateway",
+            "exp": (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() + 3600) as usize,
+        });
+
+        let token = jsonwebtoken::encode(
+            &jsonwebtoken::Header::default(),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+
+        let result = authenticator
+            .authenticate(&headers, "relayx:gateway:invoke")
+            .await;
+        assert!(result.is_ok());
+        let ctx = result.unwrap();
+        assert_eq!(ctx.tenant_id, "tenant_123");
+        assert_eq!(ctx.project_id, "proj_abc");
+        assert!(ctx.scopes.contains(&"relayx:gateway:invoke".to_string()));
+    }
+
+    #[tokio::test]
+    async fn jwt_auth_rejects_expired_token() {
+        let secret = "test-secret-that-is-long-enough";
+        let config = JwtAuthConfig {
+            issuer: None,
+            audience: None,
+            secret: secret.to_string(),
+        };
+        let authenticator = JwtAuthenticator::new(config);
+
+        let claims = serde_json::json!({
+            "sub": "tenant_123",
+            "exp": 1000, // expired long ago
+        });
+
+        let token = jsonwebtoken::encode(
+            &jsonwebtoken::Header::default(),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+
+        let result = authenticator
+            .authenticate(&headers, "relayx:gateway:invoke")
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn jwt_auth_rejects_wrong_scope() {
+        let secret = "test-secret-that-is-long-enough";
+        let config = JwtAuthConfig {
+            issuer: None,
+            audience: None,
+            secret: secret.to_string(),
+        };
+        let authenticator = JwtAuthenticator::new(config);
+
+        let claims = serde_json::json!({
+            "sub": "tenant_123",
+            "scope": "relayx:models:read",
+            "exp": (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() + 3600) as usize,
+        });
+
+        let token = jsonwebtoken::encode(
+            &jsonwebtoken::Header::default(),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+
+        // Should fail: token only has models:read, but we require keys:write
+        let result = authenticator
+            .authenticate(&headers, "relayx:keys:write")
+            .await;
+        assert!(result.is_err());
     }
 }

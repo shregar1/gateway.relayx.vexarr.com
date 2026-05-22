@@ -1,29 +1,40 @@
-use crate::auth::{Authenticator, LocalAuthenticator};
+use crate::auth::{Authenticator, JwtAuthenticator, LocalAuthenticator};
+use crate::budget::{BudgetTracker, DisabledBudgetTracker, LocalBudgetTracker};
 use crate::cache::{ExactCache, LocalExactCache, RedisExactCache};
+use crate::db;
+use crate::guardrails::GuardrailMode;
 use crate::health::ProviderHealthRegistry;
 use crate::integrations::{ComplianceAuditSink, EventPublisher, SchedulerIntegration, UsageMeter};
 use crate::keyx::{KeyxAuthenticator, KeyxConfig};
-use crate::logs::RequestLogStore;
+use crate::logs::{LogStore, MemoryLogStore};
 use crate::native_providers::{
     AnthropicProvider, AzureOpenAIProvider, BedrockProvider, GeminiProvider,
 };
 use crate::providers::{MockProvider, OpenAICompatibleProvider, ProviderRegistry};
 use crate::rate_limit::{LocalRateLimiter, RateLimitConfig, RateLimiter, RedisRateLimiter};
 use crate::routing::RoutingEngine;
+use crate::semantic_cache::{
+    DisabledSemanticCache, LocalSemanticCache, SemanticCache,
+};
+use sqlx::PgPool;
 use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct AppState {
     pub auth: Arc<dyn Authenticator>,
     pub audit_sink: Arc<dyn ComplianceAuditSink>,
+    pub budget: Arc<dyn BudgetTracker>,
     pub cache: Arc<dyn ExactCache>,
+    pub db: Option<PgPool>,
+    pub guardrail_mode: GuardrailMode,
     pub health: ProviderHealthRegistry,
-    pub logs: RequestLogStore,
+    pub logs: Arc<dyn LogStore>,
     pub event_publisher: Arc<dyn EventPublisher>,
     pub providers: Arc<ProviderRegistry>,
     pub rate_limiter: Arc<dyn RateLimiter>,
     pub routing: Arc<RoutingEngine>,
     pub scheduler: Arc<dyn SchedulerIntegration>,
+    pub semantic_cache: Arc<dyn SemanticCache>,
     pub usage_meter: Arc<dyn UsageMeter>,
 }
 
@@ -33,6 +44,36 @@ impl AppState {
         providers.register("mock", Arc::new(MockProvider));
         register_native_providers(&mut providers).await;
         register_openai_compatible_providers(&mut providers).await;
+
+        let provider_names = providers.names();
+        let real_providers: Vec<_> = provider_names.iter().filter(|n| n.as_str() != "mock").collect();
+        if real_providers.is_empty() {
+            tracing::warn!("no provider API keys configured — only the mock provider is available");
+        } else {
+            tracing::info!(providers = ?real_providers, "registered providers");
+        }
+
+        // ── PostgreSQL ───────────────────────────────────────────
+        let pg_pool: Option<PgPool> = match db::database_url() {
+            Some(url) => match db::connect(&url).await {
+                Ok(pool) => {
+                    match db::run_migrations(&pool).await {
+                        Ok(()) => tracing::info!("database migrations applied"),
+                        Err(error) => tracing::error!(%error, "failed to run database migrations"),
+                    }
+                    tracing::info!("postgresql connected");
+                    Some(pool)
+                }
+                Err(error) => {
+                    tracing::error!(%error, "failed to connect to postgresql — running without database");
+                    None
+                }
+            },
+            None => {
+                tracing::info!("RELAYX_DATABASE_URL not set — running without database persistence");
+                None
+            }
+        };
 
         let redis_url = redis_url();
         let cache: Arc<dyn ExactCache> = match &redis_url {
@@ -58,10 +99,9 @@ impl AppState {
             None => Arc::new(LocalRateLimiter::new(rate_config)),
         };
 
-        let auth: Arc<dyn Authenticator> = match std::env::var("RELAYX_AUTH_MODE")
-            .unwrap_or_else(|_| "local".to_string())
-            .as_str()
-        {
+        let auth_mode = std::env::var("RELAYX_AUTH_MODE")
+            .unwrap_or_else(|_| "local".to_string());
+        let auth: Arc<dyn Authenticator> = match auth_mode.as_str() {
             "keyx" => match KeyxConfig::from_env() {
                 Ok(config) => Arc::new(KeyxAuthenticator::new(config)),
                 Err(error) => {
@@ -69,20 +109,105 @@ impl AppState {
                     Arc::new(LocalAuthenticator)
                 }
             },
-            _ => Arc::new(LocalAuthenticator),
+            "jwt" | "oidc" => match crate::auth::JwtAuthConfig::from_env() {
+                Ok(config) => {
+                    tracing::info!(
+                        issuer = ?config.issuer,
+                        audience = ?config.audience,
+                        "JWT authentication enabled"
+                    );
+                    Arc::new(JwtAuthenticator::new(config))
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "JWT config invalid, falling back to local auth");
+                    Arc::new(LocalAuthenticator)
+                }
+            },
+            _ => {
+                tracing::warn!(
+                    "RELAYX_AUTH_MODE is '{}' — using LocalAuthenticator (not recommended for production, set RELAYX_AUTH_MODE=keyx or jwt)",
+                    auth_mode
+                );
+                Arc::new(LocalAuthenticator)
+            }
         };
+
+        let semantic_cache: Arc<dyn SemanticCache> =
+            if crate::semantic_cache::semantic_cache_enabled() {
+                tracing::info!(
+                    threshold = crate::semantic_cache::semantic_cache_threshold(),
+                    "semantic cache enabled"
+                );
+                Arc::new(LocalSemanticCache::default())
+            } else {
+                Arc::new(DisabledSemanticCache)
+            };
+
+        // ── Budget: prefer DB-backed when pool is available ──────
+        let budget: Arc<dyn BudgetTracker> =
+            match crate::budget::BudgetConfig::from_env() {
+                Some(config) => {
+                    tracing::info!(
+                        daily_limit_usd = config.daily_limit_usd,
+                        downgrade_model = ?config.downgrade_model,
+                        "budget controls enabled"
+                    );
+                    match &pg_pool {
+                        Some(pool) => {
+                            tracing::info!("using database-backed budget tracker");
+                            Arc::new(db::DbBudgetTracker::new(pool.clone(), config))
+                        }
+                        None => Arc::new(LocalBudgetTracker::new(config)),
+                    }
+                }
+                None => Arc::new(DisabledBudgetTracker),
+            };
+
+        // ── Logs: prefer DB-backed when pool is available ────────
+        let logs: Arc<dyn LogStore> = match &pg_pool {
+            Some(pool) => {
+                tracing::info!("using database-backed log store");
+                Arc::new(db::DbLogStore::new(pool.clone()))
+            }
+            None => Arc::new(MemoryLogStore::new(1_000)),
+        };
+
+        let guardrail_mode = GuardrailMode::from_env();
+        if guardrail_mode != GuardrailMode::Off {
+            tracing::info!(mode = ?guardrail_mode, "prompt guardrails enabled");
+        }
+
+        // ── Routing: load defaults, then overlay DB routes ────
+        let routing = Arc::new(RoutingEngine::with_defaults());
+        if let Some(pool) = &pg_pool {
+            match db::load_routes(pool).await {
+                Ok(db_routes) if !db_routes.is_empty() => {
+                    let count = db_routes.len();
+                    routing.load_routes(db_routes);
+                    tracing::info!(count, "loaded dynamic routes from database");
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "failed to load routes from database, using defaults only");
+                }
+            }
+        }
 
         let state = Self {
             auth,
             audit_sink: crate::integrations::audit_sink_from_env(),
+            budget,
             cache,
+            db: pg_pool,
+            guardrail_mode,
             health: ProviderHealthRegistry::default(),
-            logs: RequestLogStore::new(1_000),
+            logs,
             event_publisher: crate::integrations::event_publisher_from_env(),
             providers: Arc::new(providers),
             rate_limiter,
-            routing: Arc::new(RoutingEngine::with_defaults()),
+            routing,
             scheduler: crate::integrations::scheduler_from_env(),
+            semantic_cache,
             usage_meter: crate::integrations::usage_meter_from_env(),
         };
 
@@ -253,6 +378,72 @@ async fn register_openai_compatible_providers(providers: &mut ProviderRegistry) 
         );
     }
 
+    if let Some(api_key) = secret("DEEPSEEK_API_KEY").await {
+        providers.register(
+            "deepseek",
+            Arc::new(OpenAICompatibleProvider::new(
+                "deepseek",
+                env_or("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"),
+                Some(api_key),
+            )),
+        );
+    }
+
+    if let Some(api_key) = secret("BAICHUAN_API_KEY").await {
+        providers.register(
+            "baichuan",
+            Arc::new(OpenAICompatibleProvider::new(
+                "baichuan",
+                env_or("BAICHUAN_BASE_URL", "https://api.baichuan-ai.com/v1"),
+                Some(api_key),
+            )),
+        );
+    }
+
+    if let Some(api_key) = secret("YI_API_KEY").await {
+        providers.register(
+            "yi",
+            Arc::new(OpenAICompatibleProvider::new(
+                "yi",
+                env_or("YI_BASE_URL", "https://api.lingyiwanwu.com/v1"),
+                Some(api_key),
+            )),
+        );
+    }
+
+    if let Some(api_key) = secret("MINIMAX_API_KEY").await {
+        providers.register(
+            "minimax",
+            Arc::new(OpenAICompatibleProvider::new(
+                "minimax",
+                env_or("MINIMAX_BASE_URL", "https://api.minimax.chat/v1"),
+                Some(api_key),
+            )),
+        );
+    }
+
+    if let Some(api_key) = secret("STEPFUN_API_KEY").await {
+        providers.register(
+            "stepfun",
+            Arc::new(OpenAICompatibleProvider::new(
+                "stepfun",
+                env_or("STEPFUN_BASE_URL", "https://api.stepfun.com/v1"),
+                Some(api_key),
+            )),
+        );
+    }
+
+    if let Some(api_key) = secret("SILICONFLOW_API_KEY").await {
+        providers.register(
+            "siliconflow",
+            Arc::new(OpenAICompatibleProvider::new(
+                "siliconflow",
+                env_or("SILICONFLOW_BASE_URL", "https://api.siliconflow.cn/v1"),
+                Some(api_key),
+            )),
+        );
+    }
+
     if let Some(api_key) = secret("COHERE_API_KEY").await {
         providers.register(
             "cohere",
@@ -273,6 +464,83 @@ async fn register_openai_compatible_providers(providers: &mut ProviderRegistry) 
             Arc::new(OpenAICompatibleProvider::new(
                 "openrouter",
                 env_or("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
+                Some(api_key),
+            )),
+        );
+    }
+
+    if let Some(api_key) = secret("NVIDIA_API_KEY").await {
+        providers.register(
+            "nvidia",
+            Arc::new(OpenAICompatibleProvider::new(
+                "nvidia",
+                env_or("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1"),
+                Some(api_key),
+            )),
+        );
+    }
+
+    if let Some(api_key) = secret("FRIENDLI_API_KEY").await {
+        providers.register(
+            "friendli",
+            Arc::new(OpenAICompatibleProvider::new(
+                "friendli",
+                env_or("FRIENDLI_BASE_URL", "https://api.friendli.ai/serverless/v1"),
+                Some(api_key),
+            )),
+        );
+    }
+
+    if let Some(api_key) = secret("DEEPINFRA_API_KEY").await {
+        providers.register(
+            "deepinfra",
+            Arc::new(OpenAICompatibleProvider::new(
+                "deepinfra",
+                env_or("DEEPINFRA_BASE_URL", "https://api.deepinfra.com/v1/openai"),
+                Some(api_key),
+            )),
+        );
+    }
+
+    if let Some(api_key) = secret("FIREWORKS_API_KEY").await {
+        providers.register(
+            "fireworks",
+            Arc::new(OpenAICompatibleProvider::new(
+                "fireworks",
+                env_or("FIREWORKS_BASE_URL", "https://api.fireworks.ai/inference/v1"),
+                Some(api_key),
+            )),
+        );
+    }
+
+    if let Some(api_key) = secret("NOVITA_API_KEY").await {
+        providers.register(
+            "novita",
+            Arc::new(OpenAICompatibleProvider::new(
+                "novita",
+                env_or("NOVITA_BASE_URL", "https://api.novita.ai/v3/openai"),
+                Some(api_key),
+            )),
+        );
+    }
+
+    if let Some(api_key) = secret("MEITUAN_API_KEY").await {
+        providers.register(
+            "meituan",
+            Arc::new(OpenAICompatibleProvider::new(
+                "meituan",
+                env_or("MEITUAN_BASE_URL", "https://api.meituan.com/v1"),
+                Some(api_key),
+            )),
+        );
+    }
+
+    if let Some(api_key) = secret("INCEPTION_API_KEY").await {
+        providers.register(
+            "inception",
+            Arc::new(OpenAICompatibleProvider::new(
+                "inception",
+                env_or("INCEPTION_BASE_URL", "https://api.inceptionai.org/v1"),
                 Some(api_key),
             )),
         );

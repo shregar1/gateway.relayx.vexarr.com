@@ -192,16 +192,13 @@ impl GeminiProvider {
     }
 
     fn generate_url(&self, model: &str) -> String {
-        format!(
-            "{}/models/{model}:generateContent?key={}",
-            self.base_url, self.api_key
-        )
+        format!("{}/models/{model}:generateContent", self.base_url)
     }
 
     fn stream_url(&self, model: &str) -> String {
         format!(
-            "{}/models/{model}:streamGenerateContent?alt=sse&key={}",
-            self.base_url, self.api_key
+            "{}/models/{model}:streamGenerateContent?alt=sse",
+            self.base_url
         )
     }
 }
@@ -267,6 +264,7 @@ impl ProviderAdapter for GeminiProvider {
         let response = self
             .client
             .post(self.generate_url(&route.provider_model))
+            .header("x-goog-api-key", &self.api_key)
             .json(&upstream)
             .send()
             .await
@@ -305,6 +303,7 @@ impl ProviderAdapter for GeminiProvider {
         let response = self
             .client
             .post(self.stream_url(&route.provider_model))
+            .header("x-goog-api-key", &self.api_key)
             .json(&upstream)
             .send()
             .await
@@ -623,14 +622,14 @@ fn anthropic_request(
 
     for message in &request.messages {
         match message.role.as_str() {
-            "system" => system.push(message.content.clone()),
+            "system" => system.push(message.content_text().to_string()),
             "assistant" => messages.push(AnthropicMessage {
                 role: "assistant".to_string(),
-                content: message.content.clone(),
+                content: message.content_text().to_string(),
             }),
             _ => messages.push(AnthropicMessage {
                 role: "user".to_string(),
-                content: message.content.clone(),
+                content: message.content_text().to_string(),
             }),
         }
     }
@@ -696,7 +695,7 @@ fn gemini_request(request: &ChatCompletionRequest) -> GeminiRequest {
                 "user".to_string()
             },
             parts: vec![GeminiPart {
-                text: message.content.clone(),
+                text: message.content_text().to_string(),
             }],
         })
         .collect();
@@ -771,7 +770,7 @@ fn bedrock_request(request: &ChatCompletionRequest) -> BedrockConverseRequest {
     for message in &request.messages {
         if message.role == "system" {
             system.push(BedrockTextBlock {
-                text: message.content.clone(),
+                text: message.content_text().to_string(),
             });
             continue;
         }
@@ -783,7 +782,7 @@ fn bedrock_request(request: &ChatCompletionRequest) -> BedrockConverseRequest {
                 "user".to_string()
             },
             content: vec![BedrockTextBlock {
-                text: message.content.clone(),
+                text: message.content_text().to_string(),
             }],
         });
     }
@@ -857,11 +856,9 @@ fn chat_response(
         model: route.route_alias.clone(),
         choices: vec![ChatChoice {
             index: 0,
-            message: ChatMessage {
-                role: "assistant".to_string(),
-                content,
-            },
+            message: ChatMessage::text("assistant", content),
             finish_reason,
+            tool_calls: None,
         }],
         usage,
         relayx: Some(RelayXResponseMeta {
@@ -903,18 +900,15 @@ mod tests {
         let request = ChatCompletionRequest {
             model: "claude-fast".to_string(),
             messages: vec![
-                ChatMessage {
-                    role: "system".to_string(),
-                    content: "be terse".to_string(),
-                },
-                ChatMessage {
-                    role: "user".to_string(),
-                    content: "hello".to_string(),
-                },
+                ChatMessage::text("system", "be terse"),
+                ChatMessage::text("user", "hello"),
             ],
             stream: false,
             temperature: Some(0.2),
             max_tokens: Some(100),
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
         };
 
         let transformed = anthropic_request(&route(), &request, false);
@@ -927,13 +921,13 @@ mod tests {
     fn gemini_transform_maps_assistant_to_model_role() {
         let request = ChatCompletionRequest {
             model: "gemini".to_string(),
-            messages: vec![ChatMessage {
-                role: "assistant".to_string(),
-                content: "previous".to_string(),
-            }],
+            messages: vec![ChatMessage::text("assistant", "previous")],
             stream: false,
             temperature: None,
             max_tokens: Some(12),
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
         };
 
         let transformed = gemini_request(&request);
@@ -946,18 +940,15 @@ mod tests {
         let request = ChatCompletionRequest {
             model: "bedrock-claude".to_string(),
             messages: vec![
-                ChatMessage {
-                    role: "system".to_string(),
-                    content: "be safe".to_string(),
-                },
-                ChatMessage {
-                    role: "user".to_string(),
-                    content: "hello".to_string(),
-                },
+                ChatMessage::text("system", "be safe"),
+                ChatMessage::text("user", "hello"),
             ],
             stream: false,
             temperature: Some(0.1),
             max_tokens: Some(42),
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
         };
 
         let transformed = bedrock_request(&request);
